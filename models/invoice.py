@@ -111,7 +111,15 @@ afeqWjiRVMvV4+s4Q==</FRMA></CAF><TSTED>2014-04-24T12:02:20</TSTED></DD>\
 fHlAa7j08Xff95Yb2zg31sJt6lMjSKdOK+PQp25clZuECig==</FRMT></TED>"""
 result = xmltodict.parse(timbre)
 
-server_url = {'SIIHOMO':'https://maullin.sii.cl/DTEWS/','SII':'https://palena.sii.cl/DTEWS/'}
+server_url = {
+    'SIIHOMO':'https://maullin.sii.cl/DTEWS/',
+    'SII':'https://palena.sii.cl/DTEWS/',
+}
+
+claim_url = {
+    'SIIHOMO': 'https://ws2.sii.cl/WSREGISTRORECLAMODTECERT/registroreclamodteservice',
+    'SII':'https://ws1.sii.cl/WSREGISTRORECLAMODTE/registroreclamodteservice',
+}
 
 BC = '''-----BEGIN CERTIFICATE-----\n'''
 EC = '''\n-----END CERTIFICATE-----\n'''
@@ -184,19 +192,25 @@ class invoice(models.Model):
             data = data.decode(encoding, data).encode(new_coding)
         return data
 
+    def _get_xsd_types(self):
+        return {
+          'doc': 'DTE_v10.xsd',
+          'env': 'EnvioDTE_v10.xsd',
+          'env_boleta': 'EnvioBOLETA_v11.xsd',
+          'recep' : 'Recibos_v10.xsd',
+          'env_recep' : 'EnvioRecibos_v10.xsd',
+          'env_resp': 'RespuestaEnvioDTE_v10.xsd',
+          'sig': 'xmldsignature_v10.xsd'
+        }
+
+    def _get_xsd_file(self, validacion, path=False):
+        validacion_type = self._get_xsd_types()
+        return (path or xsdpath) + validacion_type[validacion]
+
     def xml_validator(self, some_xml_string, validacion='doc'):
         if validacion == 'bol':
             return True
-        validacion_type = {
-            'doc': 'DTE_v10.xsd',
-            'env': 'EnvioDTE_v10.xsd',
-            'env_boleta': 'EnvioBOLETA_v11.xsd',
-            'recep' : 'Recibos_v10.xsd',
-            'env_recep' : 'EnvioRecibos_v10.xsd',
-            'env_resp': 'RespuestaEnvioDTE_v10.xsd',
-            'sig': 'xmldsignature_v10.xsd'
-        }
-        xsd_file = xsdpath+validacion_type[validacion]
+        xsd_file = self._get_xsd_file(validacion)
         try:
             xmlschema_doc = etree.parse(xsd_file)
             xmlschema = etree.XMLSchema(xmlschema_doc)
@@ -206,7 +220,7 @@ class invoice(models.Model):
                 xmlschema.assert_(xml_doc)
             return result
         except AssertionError as e:
-            _logger.info(etree.tostring(xml_doc))
+            _logger.warning(etree.tostring(xml_doc))
             raise UserError(_('XML Malformed Error:  %s') % e.args)
 
     '''
@@ -394,6 +408,21 @@ version="1.0">
             s = (blocksize - len(s) % blocksize) * b'\000' + s
         return s
 
+    def _append_sig(self, type, msg, message):
+        if type in ['doc', 'bol']:
+            fulldoc = self.create_template_doc1(message, msg)
+        if type=='env':
+            fulldoc = self.create_template_env1(message,msg)
+        if type=='recep':
+            fulldoc = self.append_sign_recep(message,msg)
+        if type=='env_recep':
+            fulldoc = self.append_sign_env_recep(message,msg)
+        if type=='env_resp':
+            fulldoc = self.append_sign_env_resp(message,msg)
+        if type=='env_boleta':
+            fulldoc = self.append_sign_env_bol(message,msg)
+        return fulldoc
+
     def sign_full_xml(self, message, privkey, cert, uri, type='doc'):
         doc = etree.fromstring(message)
         string = etree.tostring(doc[0])
@@ -440,31 +469,19 @@ version="1.0">
         x509_certificate.text = '\n'+textwrap.fill(cert,64)
         msg = etree.tostring(sig_root)
         msg = msg if self.xml_validator(msg, 'sig') else ''
-        if type in ['doc', 'bol']:
-            fulldoc = self.create_template_doc1(message, msg)
-        if type=='env':
-            fulldoc = self.create_template_env1(message,msg)
-        if type=='recep':
-            fulldoc = self.append_sign_recep(message,msg)
-        if type=='env_recep':
-            fulldoc = self.append_sign_env_recep(message,msg)
-        if type=='env_resp':
-            fulldoc = self.append_sign_env_resp(message,msg)
-        if type=='env_boleta':
-            fulldoc = self.append_sign_env_bol(message,msg)
-        fulldoc = fulldoc if self.xml_validator(fulldoc, type) else ''
-        return fulldoc
+        fulldoc = self._append_sig(type, msg, message)
+        return fulldoc if self.xml_validator(fulldoc, type) else ''
 
     def get_digital_signature_pem(self, comp_id):
-        obj = user = self[0].responsable_envio
+        obj = user = self[0].responsable_envio if self else False
         if not obj:
             obj = user = self.env.user
         if not obj.cert:
-            obj = self.env['res.company'].browse([comp_id.id])
+            obj = comp_id
             if not obj or not obj.cert:
                 obj = self.env['res.users'].search([("authorized_users_ids","=", user.id)])
-                if not obj.cert or not user.id in obj.authorized_users_ids.ids:
-                    return False
+            if not obj.cert or not user.id in obj.authorized_users_ids.ids:
+                return False
         signature_data = {
             'subject_name': obj.name,
             'subject_serial_number': obj.subject_serial_number,
@@ -481,11 +498,11 @@ version="1.0">
         if not obj:
             obj = user = self.env.user
         if not obj.cert:
-            obj = self.env['res.company'].browse([comp_id.id])
+            obj = comp_id
             if not obj or not obj.cert:
                 obj = self.env['res.users'].search([("authorized_users_ids","=", user.id)])
-                if not obj.cert or not user.id in obj.authorized_users_ids.ids:
-                    return False
+            if not obj.cert or not user.id in obj.authorized_users_ids.ids:
+                return False
         signature_data = {
             'subject_name': obj.name,
             'subject_serial_number': obj.subject_serial_number,
@@ -506,8 +523,24 @@ version="1.0">
             'dte_resolution_number': comp_id.dte_resolution_number}
         return resolution_data
 
+    def init_params(self, signature_d, company_id, file_name, envio_dte):
+        params = collections.OrderedDict()
+        params['rutSender'] = signature_d['subject_serial_number'][:8]
+        params['dvSender'] = signature_d['subject_serial_number'][-1]
+        params['rutCompany'] = company_id.vat[2:-1]
+        params['dvCompany'] = company_id.vat[-1]
+        params['archivo'] = (file_name,envio_dte, "text/xml")
+        return params
+
+    def procesar_recepcion(self, retorno, respuesta_dict):
+        if respuesta_dict['RECEPCIONDTE']['STATUS'] != '0':
+            _logger.info(connection_status[respuesta_dict['RECEPCIONDTE']['STATUS']])
+        else:
+            retorno.update({'sii_result': 'Enviado','sii_send_ident':respuesta_dict['RECEPCIONDTE']['TRACKID']})
+        return retorno
+
     @api.multi
-    def send_xml_file(self, envio_dte=None, file_name="envio",company_id=False, sii_result='NoEnviado', doc_ids=''):
+    def send_xml_file(self, envio_dte=None, file_name="envio", company_id=False, sii_result='NoEnviado', doc_ids='', post='/cgi_dte/UPL/DTEUpload'):
         if not company_id.dte_service_provider:
             raise UserError(_("Not Service provider selected!"))
         #try:
@@ -526,7 +559,6 @@ version="1.0">
         url = 'https://palena.sii.cl'
         if company_id.dte_service_provider == 'SIIHOMO':
             url = 'https://maullin.sii.cl'
-        post = '/cgi_dte/UPL/DTEUpload'
         headers = {
             'Accept': 'image/gif, image/x-xbitmap, image/jpeg, image/pjpeg, application/vnd.ms-powerpoint, application/ms-excel, application/msword, */*',
             'Accept-Language': 'es-cl',
@@ -537,12 +569,12 @@ version="1.0">
             'Cache-Control': 'no-cache',
             'Cookie': 'TOKEN={}'.format(token),
         }
-        params = collections.OrderedDict()
-        params['rutSender'] = signature_d['subject_serial_number'][:8]
-        params['dvSender'] = signature_d['subject_serial_number'][-1]
-        params['rutCompany'] = company_id.vat[2:-1]
-        params['dvCompany'] = company_id.vat[-1]
-        params['archivo'] = (file_name,envio_dte,"text/xml")
+        params = self.init_params(
+            signature_d,
+            company_id,
+            file_name,
+            envio_dte,
+        )
         multi  = urllib3.filepost.encode_multipart_formdata(params)
         headers.update({'Content-Length': '{}'.format(len(multi[0]))})
         response = pool.request_encode_body('POST', url+post, params, headers)
@@ -550,10 +582,7 @@ version="1.0">
         if response.status != 200:
             return retorno
         respuesta_dict = xmltodict.parse(response.data)
-        if respuesta_dict['RECEPCIONDTE']['STATUS'] != '0':
-            _logger.info(connection_status[respuesta_dict['RECEPCIONDTE']['STATUS']])
-        else:
-            retorno.update({'sii_result': 'Enviado','sii_send_ident':respuesta_dict['RECEPCIONDTE']['TRACKID']})
+        retorno = self.procesar_recepcion(retorno, respuesta_dict)
         return retorno
 
     def crear_intercambio(self):
@@ -837,7 +866,7 @@ www.sii.cl'''.format(folio, folio_inicial, folio_final)
         ('Aceptado', 'Aceptado'),
         ('Rechazado', 'Rechazado'),
         ('Reparo', 'Reparo'),
-        ('Proceso', 'Proceso'),
+        ('Proceso', 'Procesado'),
         ('Reenviar', 'Reenviar'),
         ('Anulado', 'Anulado')],
         'Resultado',
@@ -849,22 +878,48 @@ www.sii.cl'''.format(folio, folio_inicial, folio_final)
     canceled = fields.Boolean(string="Canceled?")
     estado_recep_dte = fields.Selection(
         [
-            ('no_revisado','No Revisado'),
-            ('0','Conforme'),
-            ('1','Error de Schema'),
-            ('2','Error de Firma'),
-            ('3','RUT Receptor No Corresponde'),
-            ('90','Archivo Repetido'),
-            ('91','Archivo Ilegible'),
-            ('99','Envio Rechazado - Otros')
-        ],string="Estado de Recepcion del Envio")
-    estado_recep_glosa = fields.Char(string="Información Adicional del Estado de Recepción")
-    sii_send_file_name = fields.Char(string="Send File Name")
-    responsable_envio = fields.Many2one('res.users')
+            ('recibido', 'Recibido en DTE'),
+            ('mercaderias','Recibido mercaderias'),
+            ('validate','Validada Comercial')
+        ],
+        string="Estado de Recepcion del Envio",
+        default='recibido',
+    )
+    estado_recep_glosa = fields.Char(
+        string="Información Adicional del Estado de Recepción",
+    )
+    sii_send_file_name = fields.Char(
+        string="Send File Name",
+    )
+    responsable_envio = fields.Many2one(
+        'res.users',
+    )
     ticket = fields.Boolean(string="Formato Ticket",
             default=False,
             readonly=True,
-            states={'draft': [('readonly', False)]})
+            states={'draft': [('readonly', False)]},
+    )
+    claim = fields.Selection(
+        [
+            ('ACD', 'Acepta Contenido del Documento'),
+            ('RCD', 'Reclamo al  Contenido del Documento '),
+            ('ERM', ' Otorga  Recibo  de  Mercaderías  o Servicios'),
+            ('RFP', 'Reclamo por Falta Parcial de Mercaderías'),
+            ('RFT', 'Reclamo por Falta Total de Mercaderías'),
+        ],
+        string="Reclamo",
+    )
+    claim_description = fields.Char(
+        string="Detalle Reclamo",
+        readonly=True,
+    )
+    purchase_to_done = fields.Many2many(
+        'purchase.order',
+        string="Ordenes de Compra a validar",
+        domain=[('state', 'not in',['done', 'cancel'] )],
+        readonly=True,
+        states={'draft': [('readonly', False)]},
+    )
 
     @api.multi
     def get_related_invoices_data(self):
@@ -903,6 +958,9 @@ www.sii.cl'''.format(folio, folio_inicial, folio_final)
                                                 'tipo_trabajo': 'pasivo',
                                                 'date_time': (datetime.now() + timedelta(hours=12)),
                                                 })
+            if inv.purchase_to_done:
+                for ptd in inv.purchase_to_done:
+                    ptd.write({'state': 'done'})
         super(invoice,self).invoice_validate()
 
     @api.multi
@@ -948,11 +1006,11 @@ www.sii.cl'''.format(folio, folio_inicial, folio_final)
         #    Encabezado['IdDoc']['IndServicio'] = 1,2,3,4
         # todo: forma de pago y fecha de vencimiento - opcional
         if taxInclude and MntExe == 0 and not self._es_boleta():
-        	IdDoc['MntBruto'] = 1
+            IdDoc['MntBruto'] = 1
         if not self._es_boleta():
             IdDoc['FmaPago'] = self.forma_pago or 1
         if not taxInclude and self._es_boleta():
-        	IdDoc['IndMntNeto'] = 2
+            IdDoc['IndMntNeto'] = 2
         #if self._es_boleta():
             #Servicios periódicos
         #    IdDoc['PeriodoDesde'] =
@@ -991,16 +1049,16 @@ www.sii.cl'''.format(folio, folio_inicial, folio_final)
         Receptor['RUTRecep'] = self.format_vat(self.commercial_partner_id.vat)
         Receptor['RznSocRecep'] = self._acortar_str(self.commercial_partner_id.name, 100)
         if not self._es_boleta():
-            if not self.activity_description:
+            if not self.commercial_partner_id.activity_description:
                 raise UserError(_('Seleccione giro del partner'))
-            Receptor['GiroRecep'] = self._acortar_str(self.activity_description.name, 40)
+            Receptor['GiroRecep'] = self._acortar_str(self.commercial_partner_id.activity_description.name, 40)
         if self.partner_id.phone or self.commercial_partner_id.phone:
             Receptor['Contacto'] = self._acortar_str(self.partner_id.phone or self.commercial_partner_id.phone or self.partner_id.email, 80)
         if (self.commercial_partner_id.email or self.commercial_partner_id.dte_email or self.partner_id.email or self.partner_id.dte_email) and not self._es_boleta():
             Receptor['CorreoRecep'] = self.commercial_partner_id.dte_email or self.partner_id.dte_email or self.commercial_partner_id.email or self.partner_id.email
-        Receptor['DirRecep'] = self._acortar_str(self.commercial_partner_id.street+ ' ' + (self.commercial_partner_id.street2 or ''), 70)
-        Receptor['CmnaRecep'] = self.commercial_partner_id.city_id.name
-        Receptor['CiudadRecep'] = self.commercial_partner_id.city
+        Receptor['DirRecep'] = self._acortar_str((self.partner_id.street or self.commercial_partner_id.street) + ' ' + (self.partner_id.street2 or self.commercial_partner_id.street2 or ''),70)
+        Receptor['CmnaRecep'] = self.partner_id.city_id.name or self.commercial_partner_id.city_id.name
+        Receptor['CiudadRecep'] = self.partner_id.city or self.commercial_partner_id.city
         return Receptor
 
     def _totales(self, MntExe=0, no_product=False, taxInclude=False):
@@ -1168,7 +1226,7 @@ www.sii.cl'''.format(folio, folio_inicial, folio_final)
             line_number += 1
             invoice_lines.extend([{'Detalle': lines}])
             if 'IndExe' in lines:
-            	taxInclude = False
+                taxInclude = False
         return {
                 'invoice_lines': invoice_lines,
                 'MntExe':MntExe,
@@ -1230,7 +1288,7 @@ www.sii.cl'''.format(folio, folio_inicial, folio_final)
     def _tpo_dte(self):
         tpo_dte = "Documento"
         if self.sii_document_class_id.sii_code == 43:
-        	tpo_dte = 'Liquidacion'
+            tpo_dte = 'Liquidacion'
         return tpo_dte
 
     def _timbrar(self, n_atencion=None):
@@ -1323,7 +1381,7 @@ www.sii.cl'''.format(folio, folio_inicial, folio_final)
             SubTotDTE += '<SubTotDTE>\n<TpoDTE>' + str(id_class_doc) + '</TpoDTE>\n<NroDTE>'+str(NroDte)+'</NroDTE>\n</SubTotDTE>\n'
         file_name += ".xml"
         documentos =""
-        for key in sorted(dtes.iterkeys()):
+        for key in sorted(dtes.iterkeys(), key=lambda r: int(r[0])):
             documentos += '\n'+dtes[key]
         # firma del sobre
         dtes = self.create_template_envio( RUTEmisor, RUTRecep,
@@ -1358,7 +1416,11 @@ www.sii.cl'''.format(folio, folio_inicial, folio_final)
         ns = 'urn:'+ server_url[self.company_id.dte_service_provider] + 'QueryEstUp.jws'
         _server = SOAPProxy(url, ns)
         rut = self.format_vat(self.company_id.vat, con_cero=True)
-        respuesta = _server.getEstUp(rut[:8], str(rut[-1]),track_id,token)
+        respuesta = _server.getEstUp(
+            rut[:8],
+            str(rut[-1]),
+            track_id,
+            token)
         self.sii_receipt = respuesta
         resp = xmltodict.parse(respuesta)
         status = False
@@ -1384,17 +1446,19 @@ www.sii.cl'''.format(folio, folio_inicial, folio_final)
         receptor = self.format_vat(self.commercial_partner_id.vat)
         date_invoice = datetime.strptime(self.date_invoice, "%Y-%m-%d").strftime("%d-%m-%Y")
         rut = signature_d['subject_serial_number']
-        respuesta = _server.getEstDte(rut[:8],
-                                      str(rut[-1]),
-                                      self.company_id.vat[2:-1],
-                                      self.company_id.vat[-1],
-                                      receptor[:8],
-                                      receptor[-1],
-                                      str(self.sii_document_class_id.sii_code),
-                                      str(self.sii_document_number),
-                                      date_invoice,
-                                      str(int(self.amount_total)),
-                                      token)
+        respuesta = _server.getEstDte(
+            rut[:8],
+            str(rut[-1]),
+            self.company_id.vat[2:-1],
+            self.company_id.vat[-1],
+            receptor[:8],
+            receptor[-1],
+            str(self.sii_document_class_id.sii_code),
+            str(self.sii_document_number),
+            date_invoice,
+            str(int(self.amount_total)),
+            token,
+        )
         self.sii_message = respuesta
         resp = xmltodict.parse(respuesta)
         if resp['SII:RESPUESTA']['SII:RESP_HDR']['ESTADO'] == '2':
@@ -1406,7 +1470,7 @@ www.sii.cl'''.format(folio, folio_inicial, folio_final)
                 self.sii_result = "Rechazado"
             if resp['SII:RESPUESTA']['SII:RESP_BODY']['REPARO'] == "1":
                 self.sii_result = "Reparo"
-        elif resp['SII:RESPUESTA']['SII:RESP_HDR']['ESTADO'] == "RCT":
+        elif resp['SII:RESPUESTA']['SII:RESP_HDR']['ESTADO'] == "FAU":
             self.sii_result = "Rechazado"
 
     @api.multi
@@ -1417,12 +1481,12 @@ www.sii.cl'''.format(folio, folio_inicial, folio_final)
             seed = self.get_seed(self.company_id)
             template_string = self.create_template_seed(seed)
             seed_firmado = self.sign_seed(
-                template_string, signature_d['priv_key'],
+                template_string,
+                signature_d['priv_key'],
                 signature_d['cert'])
             token = self.get_token(seed_firmado,self.company_id)
-        except:
-            _logger.info(connection_status)
-            raise UserError(connection_status)
+        except AssertionError as e:
+            raise UserError(str(e))
         if not self.sii_send_ident:
             raise UserError('No se ha enviado aún el documento, aún está en cola de envío interna en odoo')
         if self.sii_result == 'Enviado':
@@ -1430,6 +1494,87 @@ www.sii.cl'''.format(folio, folio_inicial, folio_final)
             if self.sii_result != 'Proceso':
                 return status
         return self._get_dte_status(signature_d, token)
+
+    def set_dte_claim(self, rut_emisor=False, company_id=False, sii_document_number=False, sii_document_class_id=False, claim=False):
+        rut_emisor = rut_emisor or self.format_vat(self.company_id.partner_id.vat)
+        company_id = company_id or self.company_id
+        sii_document_number =  sii_document_number or self.sii_document_number or self.reference
+        sii_document_class_id = sii_document_class_id or self.sii_document_class_id
+        claim = claim or self.claim
+        try:
+            signature_d = self.get_digital_signature_pem(
+                company_id,
+            )
+            seed = self.get_seed( company_id )
+            template_string = self.create_template_seed( seed )
+            seed_firmado = self.sign_seed(
+                template_string,
+                signature_d['priv_key'],
+                signature_d['cert'],
+            )
+            token = self.get_token(
+                seed_firmado,
+                company_id,
+            )
+        except AssertionError as e:
+            raise UserError(str(e))
+        url = claim_url[company_id.dte_service_provider] + '?wsdl'
+        _server = Client(
+            url,
+            headers= {
+                'Cookie': 'TOKEN=' + token,
+                },
+        )
+        respuesta = _server.service.ingresarAceptacionReclamoDoc(
+            rut_emisor[:-2],
+            rut_emisor[-1],
+            str(sii_document_class_id.sii_code),
+            str(sii_document_number),
+            claim,
+        )
+        if self.id:
+            self.claim_description = respuesta
+
+    @api.multi
+    def get_dte_claim(self, ):
+        try:
+            signature_d = self.get_digital_signature_pem(
+                self.company_id)
+            seed = self.get_seed(self.company_id)
+            template_string = self.create_template_seed(seed)
+            seed_firmado = self.sign_seed(
+                template_string,
+                signature_d['priv_key'],
+                signature_d['cert'])
+            token = self.get_token(seed_firmado,self.company_id)
+        except AssertionError as e:
+            raise UserError(str(e))
+        url = claim_url[self.company_id.dte_service_provider] + '?wsdl'
+        _server = Client(
+            url,
+            headers= {
+                'Cookie': 'TOKEN=' + token,
+                },
+        )
+        respuesta = _server.service.listarEventosHistDoc(
+            self.company_id.vat[2:-1],
+            self.company_id.vat[-1],
+            str(self.sii_document_class_id.sii_code),
+            str(self.sii_document_number),
+        )
+        self.claim_description = respuesta
+        #resp = xmltodict.parse(respuesta)
+        #if resp['SII:RESPUESTA']['SII:RESP_HDR']['ESTADO'] == '2':
+        #    status = {'warning':{'title':_("Error code: 2"), 'message': _(resp['SII:RESPUESTA']['SII:RESP_HDR']['GLOSA'])}}
+        #    return status
+        #if resp['SII:RESPUESTA']['SII:RESP_HDR']['ESTADO'] == "EPR":
+        #    self.sii_result = "Proceso"
+        #    if resp['SII:RESPUESTA']['SII:RESP_BODY']['RECHAZADOS'] == "1":
+        #        self.sii_result = "Rechazado"
+        #    if resp['SII:RESPUESTA']['SII:RESP_BODY']['REPARO'] == "1":
+        #        self.sii_result = "Reparo"
+        #elif resp['SII:RESPUESTA']['SII:RESP_HDR']['ESTADO'] == "RCT":
+        #    self.sii_result = "Rechazado"
 
     @api.multi
     def wizard_upload(self):
